@@ -52,15 +52,17 @@ type Client struct {
 	InstanceName string
 	actionCache  regrpc.ActionCacheClient
 	byteStream   bsgrpc.ByteStreamClient
+	logStream    bsgrpc.ByteStreamClient
 	cas          regrpc.ContentAddressableStorageClient
 	execution    regrpc.ExecutionClient
 	operations   opgrpc.OperationsClient
 	// Retrier is the Retrier that is used for RPCs made by this client.
 	//
 	// These fields are logically "protected" and are intended for use by extensions of Client.
-	Retrier       *Retrier
-	Connection    *grpc.ClientConn
-	CASConnection *grpc.ClientConn // Can be different from Connection a separate CAS endpoint is provided.
+	Retrier             *Retrier
+	Connection          *grpc.ClientConn
+	CASConnection       *grpc.ClientConn // Can be different from Connection a separate CAS endpoint is provided.
+	LogStreamConnection *grpc.ClientConn // Optional
 	// ChunkMaxSize is maximum chunk size to use for CAS uploads/downloads.
 	ChunkMaxSize ChunkMaxSize
 	// MaxBatchDigests is maximum amount of digests to batch in batched operations.
@@ -89,6 +91,12 @@ func (c *Client) Close() error {
 	err := c.Connection.Close()
 	if err != nil {
 		return err
+	}
+	if c.LogStreamConnection != nil {
+		err := c.LogStreamConnection.Close()
+		if err != nil {
+			return err
+		}
 	}
 	if c.CASConnection != c.Connection {
 		return c.CASConnection.Close()
@@ -197,6 +205,9 @@ type DialParams struct {
 	// CASService contains the address of the CAS service, if it is separate from
 	// the remote execution service.
 	CASService string
+
+	// LogStreamService contains the address of a LogStream service, if specified
+	LogStreamService string
 
 	// UseApplicationDefault indicates that the default credentials should be used.
 	UseApplicationDefault bool
@@ -317,23 +328,39 @@ func NewClient(ctx context.Context, instanceName string, params DialParams, opts
 	if err != nil {
 		return nil, err
 	}
+
+	var logStreamConn *grpc.ClientConn = nil
+	log.Infof("No LogStream service %s", params.LogStreamService)
+	if params.LogStreamService != "" {
+		log.Infof("Connecting to LogStream service %s", params.LogStreamService)
+		connection, err := Dial(ctx, params.LogStreamService, params)
+
+		if err != nil {
+			return nil, err
+		}
+
+		logStreamConn = connection
+	}
+
 	client := &Client{
-		InstanceName:    instanceName,
-		actionCache:     regrpc.NewActionCacheClient(casConn),
-		byteStream:      bsgrpc.NewByteStreamClient(casConn),
-		cas:             regrpc.NewContentAddressableStorageClient(casConn),
-		execution:       regrpc.NewExecutionClient(conn),
-		operations:      opgrpc.NewOperationsClient(conn),
-		rpcTimeout:      time.Minute,
-		Connection:      conn,
-		CASConnection:   casConn,
-		ChunkMaxSize:    chunker.DefaultChunkSize,
-		MaxBatchDigests: DefaultMaxBatchDigests,
-		MaxBatchSize:    DefaultMaxBatchSize,
-		useBatchOps:     true,
-		casUploaders:    make(chan bool, DefaultCASConcurrency),
-		casDownloaders:  make(chan bool, DefaultCASConcurrency),
-		Retrier:         RetryTransient(),
+		InstanceName:        instanceName,
+		actionCache:         regrpc.NewActionCacheClient(casConn),
+		byteStream:          bsgrpc.NewByteStreamClient(casConn),
+		cas:                 regrpc.NewContentAddressableStorageClient(casConn),
+		execution:           regrpc.NewExecutionClient(conn),
+		logStream:           bsgrpc.NewByteStreamClient(logStreamConn),
+		operations:          opgrpc.NewOperationsClient(conn),
+		rpcTimeout:          time.Minute,
+		Connection:          conn,
+		CASConnection:       casConn,
+		LogStreamConnection: logStreamConn,
+		ChunkMaxSize:        chunker.DefaultChunkSize,
+		MaxBatchDigests:     DefaultMaxBatchDigests,
+		MaxBatchSize:        DefaultMaxBatchSize,
+		useBatchOps:         true,
+		casUploaders:        make(chan bool, DefaultCASConcurrency),
+		casDownloaders:      make(chan bool, DefaultCASConcurrency),
+		Retrier:             RetryTransient(),
 	}
 	for _, o := range opts {
 		o.Apply(client)
@@ -457,6 +484,24 @@ func (c *Client) Read(ctx context.Context, req *bspb.ReadRequest) (res bsgrpc.By
 	opts := c.RPCOpts()
 	err = c.Retrier.Do(ctx, func() (e error) {
 		res, e = c.byteStream.Read(ctx, req, opts...)
+		return e
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// ReadLogStream wraps the underlying call with specific client options.
+// If no LogStreamConnection is set for the client, returns an error.
+func (c *Client) ReadLogStream(ctx context.Context, req *bspb.ReadRequest) (res bsgrpc.ByteStream_ReadClient, err error) {
+	if c.LogStreamConnection == nil {
+		return nil, fmt.Errorf("No LogStream endpoint specified for this client")
+	}
+
+	opts := c.RPCOpts()
+	err = c.Retrier.Do(ctx, func() (e error) {
+		res, e = c.logStream.Read(ctx, req, opts...)
 		return e
 	})
 	if err != nil {
