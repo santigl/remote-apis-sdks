@@ -4,6 +4,7 @@ package rexec
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	log "github.com/golang/glog"
 	tspb "github.com/golang/protobuf/ptypes/timestamp"
+	bspb "google.golang.org/genproto/googleapis/bytestream"
 )
 
 // Client is a remote execution client.
@@ -252,6 +254,35 @@ func (ec *Context) UpdateCachedResult() {
 	}
 }
 
+func readLogStream(streamResourceName string, ec *Context, write func([]byte)) {
+	log.V(1).Infof("Reading LogStream [%s]", streamResourceName)
+
+	readRequest := bspb.ReadRequest{
+		ResourceName: streamResourceName,
+		ReadOffset:   0,
+		ReadLimit:    0}
+
+	stream, err := ec.client.GrpcClient.ReadLogStream(ec.ctx, &readRequest)
+	if err != nil {
+		log.Errorf("Error reading LogStream [%s]: %s", streamResourceName, err)
+		return
+	}
+
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+
+			log.Errorf("Error receiving LogStream data: %s", err)
+			return
+		}
+
+		write(resp.Data)
+	}
+}
+
 // ExecuteRemotely tries to execute the command remotely and download the results. It uploads any
 // missing inputs first.
 func (ec *Context) ExecuteRemotely() {
@@ -272,11 +303,34 @@ func (ec *Context) ExecuteRemotely() {
 	ec.Metadata.MissingDigests = missing
 	log.V(1).Infof("%s> Executing remotely...\n%s", cmdID, strings.Join(ec.cmd.Args, " "))
 	ec.Metadata.EventTimes[command.EventExecuteRemotely] = &command.TimeInterval{From: time.Now()}
-	op, err := ec.client.GrpcClient.ExecuteAndWait(ec.ctx, &repb.ExecuteRequest{
+
+	stdoutStreamName := ""
+	stderrStreamName := ""
+	processProgressCallback := func(metadata *repb.ExecuteOperationMetadata) {
+		if ec.client.GrpcClient.LogStreamConnection != nil {
+			log.V(1).Infof("Got ExecuteOperationMetadata for [%s] in stage %s",
+				metadata.ActionDigest, metadata.Stage)
+
+			// Spawn threads to start reading and printing the standard outputs only for the first
+			// message that contains a non-empty resource name:
+			if stdoutStreamName == "" && metadata.StdoutStreamName != "" {
+				stdoutStreamName = metadata.StdoutStreamName
+				go readLogStream(stdoutStreamName, ec, ec.oe.WriteOut)
+			}
+
+			if stderrStreamName == "" && metadata.StderrStreamName != "" {
+				stderrStreamName = metadata.StderrStreamName
+				go readLogStream(stderrStreamName, ec, ec.oe.WriteErr)
+			}
+
+		}
+	}
+
+	op, err := ec.client.GrpcClient.ExecuteAndWaitProgress(ec.ctx, &repb.ExecuteRequest{
 		InstanceName:    ec.client.GrpcClient.InstanceName,
 		SkipCacheLookup: !ec.opt.AcceptCached || ec.opt.DoNotCache,
 		ActionDigest:    ec.Metadata.ActionDigest.ToProto(),
-	})
+	}, processProgressCallback)
 	ec.Metadata.EventTimes[command.EventExecuteRemotely].To = time.Now()
 	if err != nil {
 		ec.Result = command.NewRemoteErrorResult(err)
