@@ -32,6 +32,8 @@ var (
 	Service = flag.String("service", "", "The remote execution service to dial when calling via gRPC, including port, such as 'localhost:8790' or 'remotebuildexecution.googleapis.com:443'")
 	// CASService represents the host (and, if applicable, port) of the CAS service, if different from the remote execution service.
 	CASService = flag.String("cas_service", "", "The CAS service to dial when calling via gRPC, including port, such as 'localhost:8790' or 'remotebuildexecution.googleapis.com:443'")
+	// LogStreamService represents the host (and, if applicable, port) of an optional LogStream service.
+	LogStreamService = flag.String("logstream_service", "", "The LogStream service to dial when calling via gRPC, including port, such as 'localhost:8790' or 'remotebuildexecution.googleapis.com:443'")
 	// Instance gives the instance of remote execution to test (in
 	// projects/[PROJECT_ID]/instances/[INSTANCE_NAME] format for Google RBE).
 	Instance = flag.String("instance", "", "The instance ID to target when calling remote execution via gRPC (e.g., projects/$PROJECT/instances/default_instance for Google RBE).")
@@ -43,6 +45,7 @@ func NewClientFromFlags(ctx context.Context, opts ...client.Opt) (*client.Client
 	return client.NewClient(ctx, *Instance, client.DialParams{
 		Service:               *Service,
 		CASService:            *CASService,
+		LogStreamService:      *LogStreamService,
 		CredFile:              *CredFile,
 		UseApplicationDefault: *UseApplicationDefaultCreds,
 		UseComputeEngine:      *UseGCECredentials,
