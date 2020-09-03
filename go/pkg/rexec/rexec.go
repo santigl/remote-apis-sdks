@@ -47,6 +47,9 @@ type Context struct {
 	Metadata *command.Metadata
 	// The result of the current execution, if available.
 	Result *command.Result
+	// Whether the standard outputs were already read from a stream during the execution
+	stdoutStreamedBytes int64
+	stderrStreamedBytes int64
 }
 
 // NewContext starts a new Context for a given command.
@@ -60,12 +63,14 @@ func (c *Client) NewContext(ctx context.Context, cmd *command.Command, opt *comm
 		return nil, err
 	}
 	return &Context{
-		ctx:      grpcCtx,
-		cmd:      cmd,
-		opt:      opt,
-		oe:       oe,
-		client:   c,
-		Metadata: &command.Metadata{EventTimes: make(map[string]*command.TimeInterval)},
+		ctx:                 grpcCtx,
+		cmd:                 cmd,
+		opt:                 opt,
+		oe:                  oe,
+		client:              c,
+		Metadata:            &command.Metadata{EventTimes: make(map[string]*command.TimeInterval)},
+		stdoutStreamedBytes: 0,
+		stderrStreamedBytes: 0,
 	}, nil
 }
 
@@ -115,12 +120,18 @@ func (ec *Context) downloadResults() *command.Result {
 	ec.setOutputMetadata()
 	ec.Metadata.EventTimes[command.EventDownloadResults] = &command.TimeInterval{From: time.Now()}
 	defer func() { ec.Metadata.EventTimes[command.EventDownloadResults].To = time.Now() }()
-	if err := ec.downloadStream(ec.resPb.StdoutRaw, ec.resPb.StdoutDigest, ec.oe.WriteOut); err != nil {
-		return command.NewRemoteErrorResult(err)
+
+	if ec.stdoutStreamedBytes != ec.resPb.StdoutDigest.SizeBytes {
+		if err := ec.downloadStream(ec.resPb.StdoutRaw, ec.resPb.StdoutDigest, ec.oe.WriteOut); err != nil {
+			return command.NewRemoteErrorResult(err)
+		}
 	}
-	if err := ec.downloadStream(ec.resPb.StderrRaw, ec.resPb.StderrDigest, ec.oe.WriteErr); err != nil {
-		return command.NewRemoteErrorResult(err)
+	if ec.stderrStreamedBytes != ec.resPb.StderrDigest.SizeBytes {
+		if err := ec.downloadStream(ec.resPb.StderrRaw, ec.resPb.StderrDigest, ec.oe.WriteErr); err != nil {
+			return command.NewRemoteErrorResult(err)
+		}
 	}
+
 	if ec.opt.DownloadOutputs {
 		if err := ec.client.GrpcClient.DownloadActionOutputs(ec.ctx, ec.resPb, ec.cmd.ExecRoot, ec.client.FileMetadataCache); err != nil {
 			return command.NewRemoteErrorResult(err)
@@ -254,7 +265,7 @@ func (ec *Context) UpdateCachedResult() {
 	}
 }
 
-func readLogStream(streamResourceName string, ec *Context, write func([]byte)) {
+func readLogStream(streamResourceName string, ec *Context, write func([]byte), bytesReadCounter *int64) {
 	log.V(1).Infof("Reading LogStream [%s]", streamResourceName)
 
 	readRequest := bspb.ReadRequest{
@@ -280,6 +291,7 @@ func readLogStream(streamResourceName string, ec *Context, write func([]byte)) {
 		}
 
 		write(resp.Data)
+		*bytesReadCounter += int64(len(resp.Data))
 	}
 }
 
@@ -315,12 +327,12 @@ func (ec *Context) ExecuteRemotely() {
 			// message that contains a non-empty resource name:
 			if stdoutStreamName == "" && metadata.StdoutStreamName != "" {
 				stdoutStreamName = metadata.StdoutStreamName
-				go readLogStream(stdoutStreamName, ec, ec.oe.WriteOut)
+				go readLogStream(stdoutStreamName, ec, ec.oe.WriteOut, &ec.stdoutStreamedBytes)
 			}
 
 			if stderrStreamName == "" && metadata.StderrStreamName != "" {
 				stderrStreamName = metadata.StderrStreamName
-				go readLogStream(stderrStreamName, ec, ec.oe.WriteErr)
+				go readLogStream(stderrStreamName, ec, ec.oe.WriteErr, &ec.stderrStreamedBytes)
 			}
 
 		}
