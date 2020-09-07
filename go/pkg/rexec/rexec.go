@@ -47,7 +47,7 @@ type Context struct {
 	Metadata *command.Metadata
 	// The result of the current execution, if available.
 	Result *command.Result
-	// Whether the standard outputs were already read from a stream during the execution
+	// How many bytes of logs were streamed (or -1 when no stream was read)
 	stdoutStreamedBytes int64
 	stderrStreamedBytes int64
 }
@@ -69,8 +69,8 @@ func (c *Client) NewContext(ctx context.Context, cmd *command.Command, opt *comm
 		oe:                  oe,
 		client:              c,
 		Metadata:            &command.Metadata{EventTimes: make(map[string]*command.TimeInterval)},
-		stdoutStreamedBytes: 0,
-		stderrStreamedBytes: 0,
+		stdoutStreamedBytes: -1,
+		stderrStreamedBytes: -1,
 	}, nil
 }
 
@@ -122,11 +122,19 @@ func (ec *Context) downloadResults() *command.Result {
 	defer func() { ec.Metadata.EventTimes[command.EventDownloadResults].To = time.Now() }()
 
 	if ec.stdoutStreamedBytes != ec.resPb.StdoutDigest.SizeBytes {
+		if ec.stdoutStreamedBytes > 0 { // Read LogStream but failed to receive the complete logs
+			ec.oe.WriteOut([]byte("-- LogStream is incomplete, fetching stdout from CAS. Complete output below. --\n"))
+		}
+
 		if err := ec.downloadStream(ec.resPb.StdoutRaw, ec.resPb.StdoutDigest, ec.oe.WriteOut); err != nil {
 			return command.NewRemoteErrorResult(err)
 		}
 	}
 	if ec.stderrStreamedBytes != ec.resPb.StderrDigest.SizeBytes {
+		if ec.stderrStreamedBytes > 0 { // Read LogStream but failed to receive the complete logs
+			ec.oe.WriteErr([]byte("-- LogStream is incomplete, fetching stderr from CAS. Complete output below. --\n"))
+		}
+
 		if err := ec.downloadStream(ec.resPb.StderrRaw, ec.resPb.StderrDigest, ec.oe.WriteErr); err != nil {
 			return command.NewRemoteErrorResult(err)
 		}
@@ -327,11 +335,13 @@ func (ec *Context) ExecuteRemotely() {
 			// message that contains a non-empty resource name:
 			if stdoutStreamName == "" && metadata.StdoutStreamName != "" {
 				stdoutStreamName = metadata.StdoutStreamName
+				ec.stdoutStreamedBytes = 0
 				go readLogStream(stdoutStreamName, ec, ec.oe.WriteOut, &ec.stdoutStreamedBytes)
 			}
 
 			if stderrStreamName == "" && metadata.StderrStreamName != "" {
 				stderrStreamName = metadata.StderrStreamName
+				ec.stderrStreamedBytes = 0
 				go readLogStream(stderrStreamName, ec, ec.oe.WriteErr, &ec.stderrStreamedBytes)
 			}
 
